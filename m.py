@@ -5,14 +5,16 @@ import string
 
 BlockSpec = collections.namedtuple( 'BlockSpec',
                                     [ 'input_nf',
+                                      'output_nf',
                                       'expand_ratio',
                                       'dw_kernel_size',
                                       'dw_strides',
                                       'se_ratio',
-                                      'output_nf',
-                                      'dropout_rate',
+                                      'drop_conn_rate',
                                       'skip_conn',
-                                      'repeat_num'])
+                                      'repeat_num',
+                                      'activation',
+                                      'prefix'])
 
 NNSpec = collections.namedtuple( 'NNSpec',
                                  ['w',
@@ -28,6 +30,75 @@ class SWISH( tf.keras.layers.Layer ):
         super(SWISH, self).__init__(**kwargs)
     def call(self, inputs, **kwargs):
         return tf.nn.swish(inputs)
+
+def mobilenet_v2_block( inputs, block_spec:BlockSpec ):
+    conv_kernel_initializer = tf.keras.initializers.VarianceScaling(scale=2.0,
+                                                                    mode='fan_out',
+                                                                    distribution='normal')
+    dense_kernel_initializer = tf.keras.initializers.VarianceScaling(scale=1./3,
+                                                                     mode='fan_out',
+                                                                     distribution='uniform')
+    # feature expanding
+    expand_nf = block_spec.input_nf * block_spec.expand_ratio
+    if block_spec.expand_ratio != 1:
+        x = tf.keras.layers.Conv2D( expand_nf,
+                                    1,
+                                    padding='same',
+                                    use_bias=False,
+                                    kernel_initializer=conv_kernel_initializer,
+                                    name=block_spec.prefix + 'expanding_conv')(inputs)
+        x = tf.keras.layers.BatchNormalization(name=block_spec.prefix + 'expanding_bn')(x)
+        x = tf.keras.layers.Activation(block_spec.activation, name=block_spec.prefix + 'expanding_nonlinear')(x)
+    else:
+        x = inputs
+
+    # Depthwise Convolution
+    x = tf.keras.layers.DepthwiseConv2D( block_spec.dw_kernel_size,
+                                         block_spec.dw_strides,
+                                         padding='same',
+                                         use_bias=False,
+                                         depthwise_initializer=conv_kernel_initializer,
+                                         name=block_spec.prefix + 'dw_conv')(x)
+    x = tf.keras.layers.BatchNormalization(name=block_spec.prefix + 'dw_bn')(x)
+    x = tf.keras.layers.Activation(block_spec.activation, name=block_spec.prefix + 'dw_nonlinear')(x)
+
+    # Squeeze and Excitation Module
+    if 0 < block_spec.se_ratio < 1.:
+        se_nf = max( 1, int(block_spec.input_nf * block_spec.se_ratio) )
+        se = tf.keras.layers.GlobalAveragePooling2D(name=block_spec.prefix + 'se_pooling')(x)
+        se = tf.keras.layers.Reshape(target_shape=[1,1,expand_nf], name=block_spec.prefix + 'se_reshape')(se)
+        se = tf.keras.layers.Conv2D( se_nf,
+                                     1,
+                                     padding='same',
+                                     activation=block_spec.activation,
+                                     kernel_initializer=conv_kernel_initializer,
+                                     name=block_spec.prefix + 'se_reduce')(se)
+        se = tf.keras.layers.Conv2D( expand_nf,
+                                     1,
+                                     padding='same',
+                                     activation='sigmoid',
+                                     kernel_initializer=conv_kernel_initializer,
+                                     name=block_spec.prefix + 'se_expand')(se)
+        x = tf.keras.layers.Multiply(name=block_spec.prefix + 'se_multiply')([se, x])
+
+    # projecting step
+    x = tf.keras.layers.Conv2D( block_spec.output_nf,
+                                1,
+                                padding='same',
+                                use_bias=False,
+                                kernel_initializer=conv_kernel_initializer,
+                                name=block_spec.prefix + 'projecting_conv'
+                                )(x)
+    x = tf.keras.layers.BatchNormalization(name=block_spec.prefix + 'projecting_bn')(x)
+    if block_spec.skip_conn and block_spec.dw_strides==1 and block_spec.input_nf==block_spec.output_nf:
+        if block_spec.drop_conn_rate > 0:
+            x = tf.keras.layers.Dropout(block_spec.drop_conn_rate,
+                                        noise_shape=[None,1,1,1],
+                                        name=block_spec.prefix + 'drop_conn')(x)
+
+        x = tf.keras.layers.Add(name=block_spec.prefix + 'add')([x, inputs])
+
+    return x
 
 class MobileV2Block( tf.keras.layers.Layer ):
     # block designed in MobileNetV2

@@ -1,7 +1,7 @@
 import tensorflow as tf
 import collections
 import math
-import string
+from tensorflow.keras.layers.experimental import preprocessing
 
 BlockSpec = collections.namedtuple( 'BlockSpec',
                                     [ 'input_nf',
@@ -15,6 +15,7 @@ BlockSpec = collections.namedtuple( 'BlockSpec',
                                       'repeat_num',
                                       'activation',
                                       'prefix'])
+BlockSpec.__new__.__defaults__ = (None,) * len(BlockSpec._fields)
 
 NNSpec = collections.namedtuple( 'NNSpec',
                                  ['w',
@@ -22,14 +23,11 @@ NNSpec = collections.namedtuple( 'NNSpec',
                                   'depth_divisor',
                                   'include_top',
                                   'dropout_rate',
-                                  'classes'])
-
-class SWISH( tf.keras.layers.Layer ):
-    # wrap the swish function to accept name
-    def __init__(self, **kwargs):
-        super(SWISH, self).__init__(**kwargs)
-    def call(self, inputs, **kwargs):
-        return tf.nn.swish(inputs)
+                                  'classes',
+                                  'activation',
+                                  'drop_conn_rate',
+                                  'pooling'])
+NNSpec.__new__.__defaults__ = (None,) * len(NNSpec._fields)
 
 def mobilenet_v2_block( inputs, block_spec:BlockSpec ):
     conv_kernel_initializer = tf.keras.initializers.VarianceScaling(scale=2.0,
@@ -249,35 +247,30 @@ class EfficientNet(tf.keras.Model):
                                                  use_bias=False,
                                                  name='stem_conv')
         self._stem_bn = tf.keras.layers.BatchNormalization(name='stem_bn')
-        self._stem_nonlinear = SWISH(name='stem_swish')
+        self._stem_nonlinear = tf.keras.layers.Activation(nn_spec.activation, name='stem_nonlinear')
 
         # Several stages of MobileNetV2 blocks
-        block_num_sum = sum( block_spec.repeat_num for block_spec in block_specs )
+        block_num_sum = sum( round_repeats(block_spec.repeat_num, nn_spec.d) for block_spec in block_specs ) *1.
         block_index = 0
 
         for block_stage, block_spec in enumerate(block_specs):
             block_spec = block_spec._replace(
                 input_nf=round_filters(block_spec.input_nf, nn_spec.w, nn_spec.depth_divisor),
                 output_nf=round_filters(block_spec.output_nf, nn_spec.w, nn_spec.depth_divisor),
-                repeat_num=round_repeats(block_spec.repeat_num, nn_spec.d ),
-                dropout_rate=nn_spec.dropout_rate * block_index / block_num_sum
+                repeat_num=round_repeats(block_spec.repeat_num, nn_spec.d )
             )
-            self._building_blocks.append(MobileV2Block(block_spec, prefix='block{}a_'.format(block_stage+1)))
-            block_index += 1
 
-            if block_spec.repeat_num > 1:
-                block_spec = block_spec._replace(
-                    input_nf=block_spec.output_nf,
-                    dw_strides=1
-                )
-                for sub_block_index in range(block_spec.repeat_num-1):
+            for sub_block_index in range(block_spec.repeat_num):
+                block_spec = block_spec._replace( drop_conn_rate=nn_spec.drop_conn_rate * block_index / block_num_sum,
+                                                  prefix='block{}{}_'.format(block_stage, chr(sub_block_index+97) ))
+                if sub_block_index > 0:
                     block_spec = block_spec._replace(
-                        dropout_rate=nn_spec.dropout_rate * block_index / block_num_sum)
+                        dw_strides=1,
+                        input_nf=block_spec.output_nf
+                    )
+                self._building_blocks.append(block_spec)
+                block_index += 1
 
-                    _prefix = 'block{}{}_'.format(block_stage+1, string.ascii_lowercase[sub_block_index+1])
-                    self._building_blocks.append(MobileV2Block(block_spec, prefix=_prefix))
-
-                    block_index += 1
         # cnn head
         self._head_conv = tf.keras.layers.Conv2D(round_filters(1280, nn_spec.w, nn_spec.depth_divisor),
                                                  kernel_size=1,
@@ -287,17 +280,29 @@ class EfficientNet(tf.keras.Model):
                                                  use_bias=False,
                                                  name='head_conv')
         self._head_bn = tf.keras.layers.BatchNormalization(name='head_bn')
-        self._head_nonlinear = SWISH(name='head_swish')
+        self._head_nonlinear = tf.keras.layers.Activation(nn_spec.activation, name='head_nonlinear')
 
-        self._top_pooling = tf.keras.layers.GlobalAveragePooling2D(name='top_pooling')
         if nn_spec.include_top:
-            if nn_spec.dropout_rate:
+            self._top_pooling = tf.keras.layers.GlobalAveragePooling2D(name='top_pooling')
+            if nn_spec.dropout_rate > 0:
                 self._top_dropout = tf.keras.layers.Dropout(nn_spec.dropout_rate, name='top_dropout')
 
             self._top_fc = tf.keras.layers.Dense( nn_spec.classes,
                                                   activation='softmax',
                                                   kernel_initializer=self._dense_kernel_initializer,
                                                   name='probs')
+        else:
+            if nn_spec.pooling == 'avg':
+                self._top_pooling = tf.keras.layers.GlobalAveragePooling2D(name='top_pooling')
+            elif nn_spec.pooling == 'max':
+                self._top_pooling = tf.keras.layers.GlobalMaxPool2D(name='top_pooling')
+            else:
+                pass
+
+        # print( self._building_blocks )
+
+        # self._xx = tf.keras.layers.Activation('relu')
+        # self._yy = tf.keras.layers.Dense(10)
 
     def call(self, inputs, training=None, mask=None):
         # stem
@@ -305,49 +310,142 @@ class EfficientNet(tf.keras.Model):
         x = self._stem_bn(x)
         x = self._stem_nonlinear(x)
 
+        # for i in self._building_blocks:
+        #     print(i)
         # main mobile blocks
-        for mobile_block in self._building_blocks:
-            x = mobile_block(x)
-
+        for block_spec in self._building_blocks:
+        #     print('hhh')
+            x = mobilenet_v2_block(x, block_spec)
+            # x = tf.keras.layers.Activation('relu')(x)
+        # x = tf.keras.layers.Activation('relu')(x)
+        # x = tf.keras.layers.Activation('relu')(x)
+        # x = tf.keras.layers.Dense(10)(x)
+        #
+        # x = self._xx(x)
+        #
+        # x = self._yy(x)
+        # x = self._yy(x)
+        #
         # top conv-bn-nonlinear
         x = self._head_conv(x)
         x = self._head_bn(x)
         x = self._head_nonlinear(x)
 
-        # output features or classification results
-        # global pooling to [None, feature_dimension]
-        x = self._top_pooling(x)
-
         if self._nn_spec.include_top:
-            if self._nn_spec.dropout_rate:
+            x = self._top_pooling(x)
+            if self._nn_spec.dropout_rate > 0:
                 x = self._top_dropout(x)
-
             x = self._top_fc(x)
+        else:
+            if self._nn_spec.pooling =='avg' or self._nn_spec.pooling =='max':
+                x = self._top_pooling(x)
 
         return x
+
+def build_efficient_net_model( block_specs, nn_spec ):
+    import tensorflow.keras.layers as L
+    _kernel_initializer = tf.keras.initializers.VarianceScaling(scale=2.0,
+                                                                mode='fan_out',
+                                                                distribution='normal')
+    _dense_kernel_initializer = tf.keras.initializers.VarianceScaling(scale=1. / 3,
+                                                                      mode='fan_out',
+                                                                      distribution='uniform')
+
+    inputs = tf.keras.Input(shape=(224,224,3))
+
+    x = preprocessing.Rescaling(1./255)(inputs)
+    x = preprocessing.Normalization()(x)
+
+    x = L.Conv2D(round_filters(32, nn_spec.w, nn_spec.depth_divisor),
+                 kernel_size=3,
+                 strides=2,
+                 kernel_initializer=_kernel_initializer,
+                 padding='same',
+                 use_bias=False,
+                 name='stem_conv')(x)
+    x = L.BatchNormalization(name='stem_bn')(x)
+    x = L.Activation(nn_spec.activation, name='stem_nonlinear')(x)
+
+    # Several stages of MobileNetV2 blocks
+    block_num_sum = sum( round_repeats(block_spec.repeat_num, nn_spec.d) for block_spec in block_specs ) *1.
+    block_index = 0
+
+    for block_stage, block_spec in enumerate(block_specs):
+        block_spec = block_spec._replace(
+            input_nf=round_filters(block_spec.input_nf, nn_spec.w, nn_spec.depth_divisor),
+            output_nf=round_filters(block_spec.output_nf, nn_spec.w, nn_spec.depth_divisor),
+            repeat_num=round_repeats(block_spec.repeat_num, nn_spec.d )
+        )
+
+        for sub_block_index in range(block_spec.repeat_num):
+            block_spec = block_spec._replace( drop_conn_rate=nn_spec.drop_conn_rate * block_index / block_num_sum,
+                                              prefix='block{}{}_'.format(block_stage+1, chr(sub_block_index+97) ))
+            if sub_block_index > 0:
+                block_spec = block_spec._replace(
+                    dw_strides=1,
+                    input_nf=block_spec.output_nf
+                )
+            x = mobilenet_v2_block( x, block_spec )
+            # self._building_blocks.append(block_spec)
+            block_index += 1
+
+    # cnn head
+    x = tf.keras.layers.Conv2D(round_filters(1280, nn_spec.w, nn_spec.depth_divisor),
+                               kernel_size=1,
+                               strides=1,
+                               kernel_initializer=_kernel_initializer,
+                               padding='same',
+                               use_bias=False,
+                               name='head_conv')(x)
+    x = L.BatchNormalization(name='head_bn')(x)
+    x = L.Activation(nn_spec.activation, name='head_nonlinear')(x)
+
+    if nn_spec.include_top:
+        x = L.GlobalAveragePooling2D(name='top_pooling')(x)
+        if nn_spec.dropout_rate > 0:
+            x = L.Dropout(nn_spec.dropout_rate, name='top_dropout')(x)
+
+        x = tf.keras.layers.Dense( nn_spec.classes,
+                                   activation='softmax',
+                                   kernel_initializer=_dense_kernel_initializer,
+                                   name='probs')(x)
+    else:
+        if nn_spec.pooling == 'avg':
+            x = tf.keras.layers.GlobalAveragePooling2D(name='top_pooling')(x)
+        elif nn_spec.pooling == 'max':
+            x = tf.keras.layers.GlobalMaxPool2D(name='top_pooling')(x)
+        else:
+            pass
+
+    model = tf.keras.Model(inputs=[inputs], outputs=[x])
+
+    return model
+
 
 def test_efficientnet_loadweight():
     DEFAULT_BLOCKS_ARGS = [
         BlockSpec(dw_kernel_size=3, repeat_num=1, input_nf=32, output_nf=16,
-                  expand_ratio=1, skip_conn=True, dw_strides=1, se_ratio=0.25, dropout_rate=0.2),
+                  expand_ratio=1, skip_conn=True, dw_strides=1, se_ratio=0.25, activation='swish'),
         BlockSpec(dw_kernel_size=3, repeat_num=2, input_nf=16, output_nf=24,
-                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, dropout_rate=0.2),
+                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, activation='swish'),
         BlockSpec(dw_kernel_size=5, repeat_num=2, input_nf=24, output_nf=40,
-                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, dropout_rate=0.2),
+                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, activation='swish'),
         BlockSpec(dw_kernel_size=3, repeat_num=3, input_nf=40, output_nf=80,
-                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, dropout_rate=0.2),
+                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, activation='swish'),
         BlockSpec(dw_kernel_size=5, repeat_num=3, input_nf=80, output_nf=112,
-                  expand_ratio=6, skip_conn=True, dw_strides=1, se_ratio=0.25, dropout_rate=0.2),
+                  expand_ratio=6, skip_conn=True, dw_strides=1, se_ratio=0.25, activation='swish'),
         BlockSpec(dw_kernel_size=5, repeat_num=4, input_nf=112, output_nf=192,
-                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, dropout_rate=0.2),
+                  expand_ratio=6, skip_conn=True, dw_strides=2, se_ratio=0.25, activation='swish'),
         BlockSpec(dw_kernel_size=3, repeat_num=1, input_nf=192, output_nf=320,
-                  expand_ratio=6, skip_conn=True, dw_strides=1, se_ratio=0.25, dropout_rate=0.2) ]
+                  expand_ratio=6, skip_conn=True, dw_strides=1, se_ratio=0.25, activation='swish') ]
 
     NNSPEC = NNSpec( w=1.,
                      d=1.,
                      depth_divisor=8,
                      include_top=True,
                      dropout_rate=0.2,
+                     activation='swish',
+                     drop_conn_rate=0.2,
                      classes=1000 )
     BASE_WEIGHTS_PATH = 'https://storage.googleapis.com/keras-applications/'
 
@@ -370,19 +468,45 @@ def test_efficientnet_loadweight():
                'cbcfe4450ddf6f3ad90b1b398090fe4a'),
     }
 
-    model = EfficientNet( DEFAULT_BLOCKS_ARGS, NNSPEC )
+    # model = EfficientNet( DEFAULT_BLOCKS_ARGS, NNSPEC )
 
     weight_path = tf.keras.utils.get_file( 'efficientnetb0.h5',
                                            BASE_WEIGHTS_PATH + 'efficientnetb0.h5',
                                            cache_subdir='modelsss',
                                            file_hash='902e53a9f72be733fc0bcb005b3ebbac')
 
-    print(weight_path)
+    # print(weight_path)
+    model = build_efficient_net_model( DEFAULT_BLOCKS_ARGS, NNSPEC )
     model.build( input_shape=(None,224,224,3) )
 
-    model.load_weights(weight_path)
+    load_status = model.load_weights(weight_path)
     # model.summary()
+    print( load_status )
+    tf.keras.utils.plot_model( model, 'bp.png', show_shapes=True, expand_nested=True )
 
+    # n = 0
+    # for layer in model.layers:
+    #     if len(layer.weights) != 0:
+    #         n += 1
+    #
+    # print(n)
+
+def test_keras_application_efficientb0():
+    model = tf.keras.applications.EfficientNetB0()
+
+    tf.keras.utils.plot_model( model , 'bbbb.png', show_shapes=True )
+
+
+    print( len(model.layers) )
+    # for layer in model.layers:
+
+    n = 0
+    for layer in model.layers:
+        if len(layer.weights) != 0:
+            n += 1
+            print( layer.name )
+
+    print(n)
 
 
 
@@ -473,13 +597,19 @@ def test_dropout2():
     print(x)
 
 def test():
-    x = tf.random.normal(shape=[1,5,4,4])
+    l = []
+    b = BlockSpec(input_nf=2)
+    l.append(b)
 
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    # x = tf.keras.layers.Dropout( 0.2 , noise_shape=[None,1,1])(x, training=True )
-    print(x)
-    print(x.shape)
+    b = b._replace(input_nf=33)
+    l.append(b)
+    # print(b)
 
+    for i in l:
+        print(i)
+
+# test()
+# test_keras_application_efficientb0()
 test_efficientnet_loadweight()
 # test_dropout2()
 # test_dropout()

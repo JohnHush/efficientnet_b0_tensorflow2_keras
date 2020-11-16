@@ -482,7 +482,7 @@ def test_efficientnet_loadweight():
     load_status = model.load_weights(weight_path)
     # model.summary()
     print( load_status )
-    tf.keras.utils.plot_model( model, 'bp.png', show_shapes=True, expand_nested=True )
+    tf.keras.utils.plot_model(model, '../bp.png', show_shapes=True, expand_nested=True)
 
     # n = 0
     # for layer in model.layers:
@@ -490,6 +490,24 @@ def test_efficientnet_loadweight():
     #         n += 1
     #
     # print(n)
+    from skimage.io import imread
+    import matplotlib.pyplot as plt
+    # img = imread('model/panda.jpg')
+    img = tf.io.gfile.GFile('model/panda.jpg', mode='rb' ).read()
+    # plt.figure()
+    # plt.imshow(img)
+    # plt.show()
+
+    from model.util import preprocess_for_eval
+    img = preprocess_for_eval(img)
+    print(img.shape)
+    img = tf.expand_dims(img, 0)
+    y = model.predict(img)
+
+    r = tf.keras.applications.efficientnet.decode_predictions( y, 5 )
+    print(r)
+
+    # print(y)
 
 def test_keras_application_efficientb0():
     model = tf.keras.applications.EfficientNetB0()

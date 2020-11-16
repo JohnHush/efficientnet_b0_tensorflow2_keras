@@ -730,6 +730,12 @@ def _build_bounding_box_lookup(bounding_box_file):
         'across %d images.' % (num_bbox, num_image))
   return images_to_bboxes
 
+def test_read_tfrecord( f_name ):
+  raw_ds = tf.data.TFRecordDataset( f_name )
+  for raw_record in raw_ds.take(1):
+    example = tf.train.Example()
+    example.ParseFromString( raw_record.numpy() )
+    print(example)
 
 def main(argv):
   assert not FLAGS.train_shards % FLAGS.num_threads, (
@@ -751,4 +757,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
-  app.run(main)
+  # app.run(main)
+  test_read_tfrecord('/Users/jh/working_data/imagenet/tfrecord/validation-00107-of-00128')
